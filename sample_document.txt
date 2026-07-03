@@ -1,0 +1,12 @@
+Employee Incident Report
+
+Reported by: Basil Faisal
+Contact: basil.faisal@example.com
+Phone: (555) 123-4567
+
+The customer, John Smith, called in regarding a billing dispute. His account is
+registered at 42 Baker Street, London. For verification purposes he provided his
+SSN 123-45-6789 and the credit card ending used for the charge was
+4111 1111 1111 1111. He was born on March 3, 1990, and is currently 34 years old.
+
+Please review this ticket with the vendor before the March 3rd deadline.
