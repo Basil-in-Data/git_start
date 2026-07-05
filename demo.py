@@ -8,6 +8,11 @@ import requests
 import streamlit as st
 from dotenv import load_dotenv
 from pypdf import PdfReader
+from reportlab.lib.colors import HexColor
+from reportlab.lib.pagesizes import LETTER
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import inch
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 from transformers import AutoModelForTokenClassification, AutoTokenizer, pipeline
 
 # Official, stable Google GenAI client
@@ -15,10 +20,17 @@ from google import genai
 from google.genai import types
 
 GROK_API_URL = "https://api.x.ai/v1/chat/completions"
-GROK_MODEL = "grok-4"
+GROK_MODEL = "grok-2"
 
 PII_MODEL_DIR = os.path.join(os.path.dirname(__file__), "pii_model")
-TEXT_EXTENSIONS = {"txt", "csv", "log", "md", "json"}
+
+# --- ENTERPRISE COLOR PALETTE (Ejada / ehub) ---
+NAVY_DEEP = "#06154D"
+NAVY_ACCENT = "#001C7F"
+MINT = "#00E676"
+MINT_ALT = "#00D27A"
+TEXT_LIGHT = "#F5F7FA"
+TEXT_GRAY = "#AAB4D4"
 
 
 def extract_text_from_upload(uploaded_file) -> str:
@@ -32,6 +44,43 @@ def extract_text_from_upload(uploaded_file) -> str:
         return "\n".join(p.text for p in document.paragraphs)
     return raw.decode("utf-8", errors="ignore")
 
+
+def build_masking_receipt_pdf(clean_text, masking_reason, timestamp, findings, masking_purpose) -> bytes:
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=LETTER, topMargin=0.75 * inch, bottomMargin=0.75 * inch)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("TitleNavy", parent=styles["Title"], textColor=HexColor(NAVY_DEEP), fontSize=18)
+    heading_style = ParagraphStyle("HeadingNavy", parent=styles["Heading2"], textColor=HexColor(NAVY_ACCENT))
+    body_style = ParagraphStyle("Body", parent=styles["BodyText"], textColor=HexColor("#1A1A1A"), fontSize=10, leading=14)
+
+    type_counts = {}
+    for f in findings:
+        type_counts[f["type"]] = type_counts.get(f["type"], 0) + 1
+    breakdown_lines = [f"{k}: {v} redacted" for k, v in type_counts.items()] or ["No PII detected"]
+
+    story = [
+        Paragraph("PII Masking — Documentation Receipt", title_style),
+        Spacer(1, 12),
+        Paragraph(f"<b>Timestamp:</b> {timestamp}", body_style),
+        Paragraph(f"<b>Masking Justification:</b> {masking_reason}", body_style),
+        Paragraph(f"<b>Masking Purpose:</b> {masking_purpose}", body_style),
+        Paragraph(f"<b>Total Items Redacted:</b> {len(findings)}", body_style),
+        Spacer(1, 8),
+        Paragraph("Breakdown by PII Type:", heading_style),
+    ]
+    for line in breakdown_lines:
+        story.append(Paragraph(f"— {line}", body_style))
+    story.append(Spacer(1, 16))
+    story.append(Paragraph("Masked Document:", heading_style))
+    story.append(Spacer(1, 6))
+    escaped = clean_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br/>")
+    story.append(Paragraph(escaped, body_style))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 # --- ENVIRONMENT & API SECURITY ---
 # API keys are read only from the local .env file (GOOGLE_API_KEY, GROK_API_KEY).
 # They are never collected via the UI, so they can't leak into screenshots,
@@ -41,10 +90,134 @@ GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 GROK_API_KEY = os.environ.get("GROK_API_KEY")
 
 # --- PAGE LAYOUT & CONFIG ---
-st.set_page_config(page_title="Data Privacy Dashboard", page_icon="🔒", layout="wide")
+st.set_page_config(page_title="Ejada | Data Privacy Dashboard", page_icon="🔒", layout="wide")
 
-st.title("🔒 Data Privacy & Prompt Engineering Dashboard")
-st.caption("Employee PII masking workflow + prompt engineering playground, powered by Gemini.")
+# --- CUSTOM ENTERPRISE THEME (Navy / Mint) ---
+st.markdown(
+    f"""
+    <style>
+    :root {{
+        --navy-deep: {NAVY_DEEP};
+        --navy-accent: {NAVY_ACCENT};
+        --mint: {MINT};
+        --mint-alt: {MINT_ALT};
+        --text-light: {TEXT_LIGHT};
+        --text-gray: {TEXT_GRAY};
+    }}
+
+    .stApp {{
+        background: linear-gradient(160deg, var(--navy-deep) 0%, var(--navy-accent) 100%);
+    }}
+
+    [data-testid="stHeader"] {{ background: rgba(0,0,0,0); }}
+
+    [data-testid="stSidebar"] {{
+        background: var(--navy-deep);
+        border-right: 1px solid rgba(0,230,118,0.25);
+    }}
+
+    .brand-header {{
+        padding: 1.25rem 1.5rem;
+        margin-bottom: 1.25rem;
+        border-radius: 12px;
+        background: linear-gradient(90deg, var(--navy-accent), var(--navy-deep));
+        border-left: 4px solid var(--mint);
+    }}
+    .brand-title {{
+        font-size: 1.8rem;
+        font-weight: 700;
+        color: var(--text-light);
+    }}
+    .brand-subtitle {{
+        font-size: 0.95rem;
+        color: var(--mint);
+        margin-top: 0.25rem;
+        letter-spacing: 0.03em;
+    }}
+
+    h1, h2, h3, h4 {{ color: var(--text-light) !important; }}
+    p, li, span, label {{ color: var(--text-gray); }}
+
+    [data-testid="stTabs"] [role="tablist"] {{
+        gap: 4px;
+        border-bottom: 1px solid rgba(0,230,118,0.2);
+    }}
+    [data-testid="stTabs"] button[role="tab"] {{
+        color: var(--text-gray);
+        background: transparent;
+        border-radius: 8px 8px 0 0;
+    }}
+    [data-testid="stTabs"] button[role="tab"][aria-selected="true"] {{
+        color: var(--mint) !important;
+        border-bottom: 3px solid var(--mint) !important;
+        background: rgba(0,230,118,0.08);
+        font-weight: 600;
+    }}
+
+    div.stButton > button, div.stDownloadButton > button {{
+        background: linear-gradient(90deg, var(--mint), var(--mint-alt));
+        color: var(--navy-deep);
+        border: none;
+        border-radius: 8px;
+        font-weight: 700;
+        padding: 0.55rem 1.2rem;
+        transition: transform 0.15s ease, box-shadow 0.15s ease;
+    }}
+    div.stButton > button:hover, div.stDownloadButton > button:hover {{
+        transform: translateY(-1px);
+        box-shadow: 0 4px 14px rgba(0,230,118,0.35);
+        color: var(--navy-deep);
+    }}
+
+    [data-testid="stTextArea"] textarea,
+    [data-testid="stTextInput"] input,
+    [data-testid="stFileUploaderDropzone"] {{
+        background: rgba(255,255,255,0.05) !important;
+        color: var(--text-light) !important;
+        border: 1px solid rgba(0,230,118,0.3) !important;
+        border-radius: 8px !important;
+    }}
+    [data-testid="stTextArea"] textarea:focus,
+    [data-testid="stTextInput"] input:focus {{
+        border-color: var(--mint) !important;
+        box-shadow: 0 0 0 1px var(--mint) !important;
+    }}
+
+    [data-testid="stSelectbox"] div[data-baseweb="select"] > div {{
+        background: rgba(255,255,255,0.05) !important;
+        border: 1px solid rgba(0,230,118,0.3) !important;
+        color: var(--text-light) !important;
+        border-radius: 8px !important;
+    }}
+
+    [data-testid="stAlert"] {{
+        border-radius: 10px !important;
+        border-left: 4px solid var(--mint) !important;
+        background: rgba(255,255,255,0.05) !important;
+    }}
+
+    [data-testid="stCodeBlock"] pre {{
+        background: rgba(0,0,0,0.35) !important;
+        border: 1px solid rgba(0,230,118,0.25) !important;
+        border-radius: 8px !important;
+        color: #E4F8ED !important;
+    }}
+
+    [data-testid="stCaptionContainer"] {{ color: var(--text-gray) !important; }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    """
+    <div class="brand-header">
+        <div class="brand-title">🔒 Data Privacy & Prompt Engineering Dashboard</div>
+        <div class="brand-subtitle">Enterprise PII Governance • Ejada / ehub Design System</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 if not GOOGLE_API_KEY:
     st.error(
@@ -55,36 +228,52 @@ if not GOOGLE_API_KEY:
 client = genai.Client() if GOOGLE_API_KEY else None
 
 
-def generate_with_fallback(prompt: str, system_prompt: str = ""):
-    """Try Gemini first; on any Gemini error, fall back to Grok if configured.
+def _call_gemini(prompt: str, system_prompt: str):
+    config = types.GenerateContentConfig(system_instruction=system_prompt) if system_prompt.strip() else None
+    response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt, config=config)
+    return response.text, "Gemini (gemini-2.5-flash)"
+
+
+def _call_grok(prompt: str, system_prompt: str):
+    messages = []
+    if system_prompt.strip():
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+    resp = requests.post(
+        GROK_API_URL,
+        headers={"Authorization": f"Bearer {GROK_API_KEY}"},
+        json={"model": GROK_MODEL, "messages": messages},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"], f"Grok ({GROK_MODEL})"
+
+
+def generate_with_fallback(prompt: str, system_prompt: str = "", preferred: str = "gemini"):
+    """Try the user-selected backend first; on any error (or if it's not
+    configured), fall back to the other backend if available.
     Returns (response_text, model_used)."""
-    gemini_error = None
-    if client is not None:
+    backends = [
+        ("gemini", _call_gemini, client is not None),
+        ("grok", _call_grok, bool(GROK_API_KEY)),
+    ]
+    if preferred == "grok":
+        backends.reverse()
+
+    first_error = None
+    for name, call_fn, available in backends:
+        if not available:
+            continue
         try:
-            config = types.GenerateContentConfig(system_instruction=system_prompt) if system_prompt.strip() else None
-            response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt, config=config)
-            return response.text, "Gemini (gemini-2.5-flash)"
+            text, label = call_fn(prompt, system_prompt)
+            if first_error is not None:
+                label = f"{label} — fallback (preferred backend failed: {first_error})"
+            return text, label
         except Exception as e:
-            gemini_error = e
+            first_error = e
 
-    if GROK_API_KEY:
-        messages = []
-        if system_prompt.strip():
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt})
-        resp = requests.post(
-            GROK_API_URL,
-            headers={"Authorization": f"Bearer {GROK_API_KEY}"},
-            json={"model": GROK_MODEL, "messages": messages},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        text = resp.json()["choices"][0]["message"]["content"]
-        suffix = f" (Gemini failed: {gemini_error})" if gemini_error else ""
-        return text, f"Grok ({GROK_MODEL}) — fallback{suffix}"
-
-    if gemini_error is not None:
-        raise gemini_error
+    if first_error is not None:
+        raise first_error
     raise RuntimeError("No API key configured for Gemini or Grok.")
 
 
@@ -164,11 +353,15 @@ class PIIMaskingModel:
             f["value"] = text[f["start"]:f["end"]]
         return merged
 
-    def mask(self, text: str):
+    def mask(self, text: str, strict: bool = False):
+        """strict=True (vendor sharing) uses a generic [REDACTED] tag that hides
+        the PII category entirely. strict=False (LLM ingestion) keeps the typed
+        tag (e.g. [REDACTED_EMAIL]) so a downstream model retains useful context."""
         findings = self.detect(text)
         clean_text = text
         for f in sorted(findings, key=lambda f: -f["start"]):
-            clean_text = clean_text[: f["start"]] + f"[REDACTED_{f['type']}]" + clean_text[f["end"] :]
+            tag = "[REDACTED]" if strict else f"[REDACTED_{f['type']}]"
+            clean_text = clean_text[: f["start"]] + tag + clean_text[f["end"] :]
         return clean_text, findings
 
 
@@ -190,6 +383,18 @@ with tab1:
     st.write(
         "Upload or paste a sensitive document, log the reason it needs to be shared, "
         "then run it through the PII masking pipeline before handing it off."
+    )
+
+    masking_purpose = st.selectbox(
+        "Masking Purpose",
+        [
+            "AI Tool Ingestion (Optimized for Large Language Models)",
+            "External Vendor Sharing (Strict Data Privacy Redaction)",
+        ],
+    )
+    st.caption(
+        "🔒 Masking always executes locally via the fine-tuned PII model below — "
+        "no document text is ever sent to an external API."
     )
 
     col1, col2 = st.columns(2)
@@ -226,8 +431,10 @@ with tab1:
         elif not masking_reason.strip():
             st.warning("Please document a reason for masking before running the pipeline.")
         else:
+            strict = masking_purpose.startswith("External Vendor")
+
             with st.spinner("Running PII classification & masking model..."):
-                clean_text, findings = pii_model.mask(source_text)
+                clean_text, findings = pii_model.mask(source_text, strict=strict)
 
             st.success("✅ Document successfully masked. Clean text is safe to share:")
             st.text_area("Masked Output", value=clean_text, height=200, disabled=True)
@@ -248,11 +455,22 @@ with tab1:
                 f"""
 - **Timestamp:** {timestamp}
 - **Masking Justification:** {masking_reason}
+- **Masking Purpose:** {masking_purpose}
 - **Total Items Redacted:** {len(findings)}
 
 **Breakdown by PII Type:**
 {breakdown}
 """
+            )
+
+            pdf_bytes = build_masking_receipt_pdf(
+                clean_text, masking_reason, timestamp, findings, masking_purpose
+            )
+            st.download_button(
+                label="📄 Download PDF Receipt",
+                data=pdf_bytes,
+                file_name=f"masking_receipt_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                mime="application/pdf",
             )
 
 # ==========================================
@@ -265,6 +483,13 @@ with tab2:
     technique = st.selectbox(
         "Select a prompt engineering strategy",
         ["Zero-Shot", "Few-Shot", "Role-Prompting"],
+    )
+    model_router = st.selectbox(
+        "Target Backend Transformer Model",
+        [
+            "Google Gemini (gemini-2.5-flash)",
+            "xAI Grok (grok-2)",
+        ],
     )
     topic = st.text_input("Core topic:", "Why data privacy matters in AI systems")
     system_prompt = st.text_area(
@@ -301,9 +526,10 @@ with tab2:
         if client is None and not GROK_API_KEY:
             st.error("Cannot generate: neither `GOOGLE_API_KEY` nor `GROK_API_KEY` is set in the environment.")
         else:
-            with st.spinner("Querying Gemini (falls back to Grok if unavailable)..."):
+            preferred = "grok" if "Grok" in model_router else "gemini"
+            with st.spinner(f"Querying {model_router} (falls back to the other backend if unavailable)..."):
                 try:
-                    text, model_used = generate_with_fallback(engineered_prompt, system_prompt)
+                    text, model_used = generate_with_fallback(engineered_prompt, system_prompt, preferred=preferred)
                     st.success(f"Model Response — via {model_used}:")
                     st.write(text)
                 except Exception as e:
