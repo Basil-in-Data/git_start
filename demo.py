@@ -106,7 +106,7 @@ st.markdown(
     }}
 
     .stApp {{
-        background: linear-gradient(160deg, var(--navy-deep) 0%, var(--navy-accent) 100%);
+        background: radial-gradient(circle at 85% 10%, #14247A 0%, var(--navy-accent) 45%, var(--navy-deep) 100%);
     }}
 
     [data-testid="stHeader"] {{ background: rgba(0,0,0,0); }}
@@ -137,6 +137,12 @@ st.markdown(
 
     h1, h2, h3, h4 {{ color: var(--text-light) !important; }}
     p, li, span, label {{ color: var(--text-gray); }}
+    /* Buttons carry their own text color below; any element inside a
+       button must inherit it, otherwise the broad paragraph text-color
+       rule above wins (a rule directly on an element always beats an
+       inherited value, regardless of the ancestor's specificity), which
+       is what made button labels unreadable against the mint fill. */
+    div.stButton > button *, div.stDownloadButton > button * {{ color: inherit !important; }}
 
     [data-testid="stTabs"] [role="tablist"] {{
         gap: 4px;
@@ -155,18 +161,29 @@ st.markdown(
     }}
 
     div.stButton > button, div.stDownloadButton > button {{
+        background: transparent;
+        color: var(--text-light);
+        border: 2px solid var(--text-light);
+        border-radius: 999px;
+        font-weight: 600;
+        padding: 0.6rem 1.8rem;
+        transition: all 0.15s ease;
+    }}
+    div.stButton > button:hover, div.stDownloadButton > button:hover {{
+        background: var(--mint);
+        border-color: var(--mint);
+        color: var(--navy-deep);
+    }}
+    div.stButton > button[kind="primary"] {{
         background: linear-gradient(90deg, var(--mint), var(--mint-alt));
         color: var(--navy-deep);
         border: none;
-        border-radius: 8px;
         font-weight: 700;
-        padding: 0.55rem 1.2rem;
-        transition: transform 0.15s ease, box-shadow 0.15s ease;
     }}
-    div.stButton > button:hover, div.stDownloadButton > button:hover {{
-        transform: translateY(-1px);
-        box-shadow: 0 4px 14px rgba(0,230,118,0.35);
+    div.stButton > button[kind="primary"]:hover {{
+        filter: brightness(1.08);
         color: var(--navy-deep);
+        box-shadow: 0 4px 14px rgba(0,230,118,0.35);
     }}
 
     [data-testid="stTextArea"] textarea,
@@ -212,7 +229,7 @@ st.markdown(
 st.markdown(
     """
     <div class="brand-header">
-        <div class="brand-title">🔒 Data Privacy & Prompt Engineering Dashboard</div>
+        <div class="brand-title">The AI Gateway</div>
         <div class="brand-subtitle">Enterprise PII Governance • Ejada / ehub Design System</div>
     </div>
     """,
