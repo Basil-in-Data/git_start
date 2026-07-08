@@ -85,7 +85,10 @@ def extract_text_from_upload(uploaded_file) -> str:
     return raw.decode("utf-8", errors="ignore")
 
 
-def build_masking_receipt_pdf(clean_text, masking_reason, timestamp, findings, masking_purpose) -> bytes:
+def build_masked_document_pdf(clean_text, timestamp, findings, masking_purpose) -> bytes:
+    """Builds the actual deliverable: a clean, shareable PDF of the redacted
+    text meant to be handed off to another model or external party — not an
+    internal audit log."""
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=LETTER, topMargin=0.75 * inch, bottomMargin=0.75 * inch)
     styles = getSampleStyleSheet()
@@ -99,10 +102,9 @@ def build_masking_receipt_pdf(clean_text, masking_reason, timestamp, findings, m
     breakdown_lines = [f"{k}: {v} redacted" for k, v in type_counts.items()] or ["No PII detected"]
 
     story = [
-        Paragraph("PII Masking — Documentation Receipt", title_style),
+        Paragraph("Redacted Document — Ready to Share", title_style),
         Spacer(1, 12),
         Paragraph(f"<b>Timestamp:</b> {timestamp}", body_style),
-        Paragraph(f"<b>Masking Justification:</b> {masking_reason}", body_style),
         Paragraph(f"<b>Masking Purpose:</b> {masking_purpose}", body_style),
         Paragraph(f"<b>Total Items Redacted:</b> {len(findings)}", body_style),
         Spacer(1, 8),
@@ -210,6 +212,10 @@ st.markdown(
         border-top: 1px solid rgba(255,255,255,0.12);
         font-size: 0.85rem;
         color: var(--sidebar-text-muted);
+    }}
+    .sidebar-divider {{
+        border-top: 1px solid rgba(255,255,255,0.12);
+        margin: 0.5rem 0 0.75rem 0;
     }}
 
     /* --- Top banner (mint) --- */
@@ -342,14 +348,29 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+TRANSPARENCY_PAGE = ("How Your Data Is Masked", "🛡️")
+
 NAV_PAGES = [
     ("Secure your files", "🔒"),
     ("Prompt Engineering", "💡"),
+    ("Chat", "💬"),
     ("Request a Model", "🔌"),
 ]
 
 if "active_page" not in st.session_state:
-    st.session_state.active_page = NAV_PAGES[0][0]
+    st.session_state.active_page = "Secure your files"
+
+
+def _sidebar_nav_button(page_name: str, icon: str):
+    is_active = st.session_state.active_page == page_name
+    if st.button(
+        f"{icon}  {page_name}",
+        key=f"nav_{page_name}",
+        type="primary" if is_active else "secondary",
+    ):
+        st.session_state.active_page = page_name
+        st.rerun()
+
 
 with st.sidebar:
     st.markdown(
@@ -361,20 +382,19 @@ with st.sidebar:
         """,
         unsafe_allow_html=True,
     )
+
+    # Kept separate from the main workflow nav below — this is a trust/
+    # transparency page, not a fifth workflow step.
+    _sidebar_nav_button(*TRANSPARENCY_PAGE)
+    st.markdown('<div class="sidebar-divider"></div>', unsafe_allow_html=True)
+
     for page_name, icon in NAV_PAGES:
-        is_active = st.session_state.active_page == page_name
-        if st.button(
-            f"{icon}  {page_name}",
-            key=f"nav_{page_name}",
-            type="primary" if is_active else "secondary",
-        ):
-            st.session_state.active_page = page_name
-            st.rerun()
+        _sidebar_nav_button(page_name, icon)
+
     st.markdown(
         """
         <div class="sidebar-footer">
-            ⚙️ Settings<br/><br/>
-            <b style="color:#FFFFFF;"> ejada</b>
+            <b style="color:#FFFFFF;">ejada</b>
         </div>
         """,
         unsafe_allow_html=True,
@@ -403,7 +423,15 @@ client = genai.Client() if GOOGLE_API_KEY else None
 def _call_gemini(prompt: str, system_prompt: str):
     config = types.GenerateContentConfig(system_instruction=system_prompt) if system_prompt.strip() else None
     response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt, config=config)
-    return response.text, "Gemini (gemini-2.5-flash)"
+    usage = None
+    meta = getattr(response, "usage_metadata", None)
+    if meta is not None:
+        usage = {
+            "prompt_tokens": meta.prompt_token_count,
+            "completion_tokens": meta.candidates_token_count,
+            "total_tokens": meta.total_token_count,
+        }
+    return response.text, "Gemini (gemini-2.5-flash)", usage
 
 
 def _call_groq(prompt: str, system_prompt: str):
@@ -418,13 +446,24 @@ def _call_groq(prompt: str, system_prompt: str):
         timeout=30,
     )
     resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"], f"Groq ({GROQ_MODEL})"
+    data = resp.json()
+    usage_raw = data.get("usage") or {}
+    usage = (
+        {
+            "prompt_tokens": usage_raw.get("prompt_tokens"),
+            "completion_tokens": usage_raw.get("completion_tokens"),
+            "total_tokens": usage_raw.get("total_tokens"),
+        }
+        if usage_raw
+        else None
+    )
+    return data["choices"][0]["message"]["content"], f"Groq ({GROQ_MODEL})", usage
 
 
 def generate_with_fallback(prompt: str, system_prompt: str = "", preferred: str = "gemini"):
     """Try the user-selected backend first; on any error (or if it's not
     configured), fall back to the other backend if available.
-    Returns (response_text, model_used)."""
+    Returns (response_text, model_used, usage_dict_or_None)."""
     backends = [
         ("gemini", _call_gemini, client is not None),
         ("groq", _call_groq, bool(GROQ_API_KEY)),
@@ -437,10 +476,10 @@ def generate_with_fallback(prompt: str, system_prompt: str = "", preferred: str 
         if not available:
             continue
         try:
-            text, label = call_fn(prompt, system_prompt)
+            text, label, usage = call_fn(prompt, system_prompt)
             if first_error is not None:
                 label = f"{label} — fallback (preferred backend failed: {first_error})"
-            return text, label
+            return text, label, usage
         except Exception as e:
             first_error = e
 
@@ -614,11 +653,6 @@ if st.session_state.active_page == "Secure your files":
                     "External Vendor Sharing (Strict Data Privacy Redaction)",
                 ],
             )
-            masking_reason = st.text_area(
-                "Reason for masking (documentation log)",
-                height=100,
-                placeholder="e.g. Sharing logs with vendor for troubleshooting",
-            )
             st.caption(
                 "🔒 Masking always executes locally via the fine-tuned PII model below — "
                 "no document text is ever sent to an external API."
@@ -634,8 +668,6 @@ if st.session_state.active_page == "Secure your files":
 
         if not source_text.strip():
             st.warning("Please upload a file or paste some text before running the pipeline.")
-        elif not masking_reason.strip():
-            st.warning("Please document a reason for masking before running the pipeline.")
         else:
             strict = masking_purpose.startswith("External Vendor")
 
@@ -643,8 +675,8 @@ if st.session_state.active_page == "Secure your files":
                 clean_text, findings = pii_model.mask(source_text, strict=strict)
 
             with st.container(border=True):
-                st.markdown('<div class="card-heading">3. Masking Log & Results</div>', unsafe_allow_html=True)
-                st.success("✅ Document successfully masked. Clean text is safe to share:")
+                st.markdown('<div class="card-heading">3. Redacted Document — Ready to Share</div>', unsafe_allow_html=True)
+                st.success("✅ Document successfully masked. Send the text below, or the PDF, to any model or external recipient:")
                 st.text_area("Masked Output", value=clean_text, height=200, disabled=True)
 
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -658,11 +690,10 @@ if st.session_state.active_page == "Secure your files":
                 )
 
                 st.markdown("---")
-                st.markdown("#### 📋 Masking Log / Documentation Receipt")
+                st.markdown("#### 📋 Redaction Summary")
                 st.markdown(
                     f"""
 - **Timestamp:** {timestamp}
-- **Masking Justification:** {masking_reason}
 - **Masking Purpose:** {masking_purpose}
 - **Total Items Redacted:** {len(findings)}
 
@@ -671,18 +702,19 @@ if st.session_state.active_page == "Secure your files":
 """
                 )
 
-                pdf_bytes = build_masking_receipt_pdf(
-                    clean_text, masking_reason, timestamp, findings, masking_purpose
-                )
+                pdf_bytes = build_masked_document_pdf(clean_text, timestamp, findings, masking_purpose)
                 st.download_button(
-                    label="📄 Download PDF Receipt",
+                    label="📄 Download Masked Document (PDF)",
                     data=pdf_bytes,
-                    file_name=f"masking_receipt_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                    file_name=f"masked_document_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
                     mime="application/pdf",
                 )
 
 elif st.session_state.active_page == "Prompt Engineering":
-    st.write("Configure a reusable prompt template on the left; watch the constructed prompt and live response build on the right.")
+    st.write(
+        "Configure a reusable prompt template on the left; watch the constructed prompt build live "
+        "on the right. This page only builds the prompt — send it to Chat to actually get an answer."
+    )
 
     config_col, results_col = st.columns(2)
 
@@ -718,7 +750,7 @@ elif st.session_state.active_page == "Prompt Engineering":
                     help=f"Fills the {{{{{var_name}}}}} placeholder in the template.",
                 )
 
-            generate = st.button("✨ Generate AI Response", type="primary")
+            send_to_chat = st.button("💬 Send to Chat", type="primary")
 
     engineered_prompt = template["template"]
     for var_name, value in variable_values.items():
@@ -734,23 +766,100 @@ elif st.session_state.active_page == "Prompt Engineering":
             st.markdown("**Engineered prompt sent to the transformer model:**")
             st.code(engineered_prompt, language="text")
 
-        with st.container(border=True):
-            st.markdown('<div class="card-heading">3. AI Response</div>', unsafe_allow_html=True)
-            st.caption("Only runs when you click \"Generate AI Response\" on the left — a separate, explicit step.")
-            if generate:
-                if client is None and not GROQ_API_KEY:
-                    st.error("Cannot generate: neither `GOOGLE_API_KEY` nor `GROQ_API_KEY` is set in the environment.")
-                else:
-                    preferred = "groq" if "Groq" in model_router else "gemini"
-                    with st.spinner(f"Querying {model_router} (falls back to the other backend if unavailable)..."):
-                        try:
-                            text, model_used = generate_with_fallback(engineered_prompt, system_prompt, preferred=preferred)
-                            st.success(f"Model Response — via {model_used}:")
-                            st.write(text)
-                        except Exception as e:
-                            st.error(f"API Error: {e}")
+    if send_to_chat:
+        st.session_state.chat_prefill = engineered_prompt
+        st.session_state.chat_system_prompt = system_prompt
+        st.session_state.chat_model_router = model_router
+        st.session_state.active_page = "Chat"
+        st.rerun()
 
-else:  # "Request a Model"
+elif st.session_state.active_page == "Chat":
+    st.write("Chat with Gemini or Groq directly, attach a file for context, or pick up a prompt built in Prompt Engineering.")
+
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+    if "chat_token_total" not in st.session_state:
+        st.session_state.chat_token_total = 0
+
+    with st.container(border=True):
+        st.markdown('<div class="card-heading">Chat Configuration</div>', unsafe_allow_html=True)
+        chat_col1, chat_col2 = st.columns(2)
+        with chat_col1:
+            default_router = st.session_state.get("chat_model_router", "Google Gemini (gemini-2.5-flash)")
+            chat_model_router = st.selectbox(
+                "Target Backend Transformer Model",
+                ["Google Gemini (gemini-2.5-flash)", "Groq (llama-3.3-70b-versatile)"],
+                index=0 if default_router.startswith("Google") else 1,
+                key="chat_model_select",
+            )
+        with chat_col2:
+            chat_system_prompt = st.text_input(
+                "System prompt (optional)",
+                value=st.session_state.get("chat_system_prompt", ""),
+                key="chat_system_input",
+            )
+        chat_file = st.file_uploader(
+            "Attach a file for context (optional)",
+            type=["txt", "csv", "log", "md", "json", "pdf", "docx"],
+            key="chat_file_uploader",
+        )
+        st.caption(f"🔢 Session token usage so far: {st.session_state.chat_token_total:,} total")
+
+    st.markdown("#### 💬 Conversation")
+    st.caption("Type a message in the box at the very bottom of the page to chat normally — no configuration above is required.")
+    if not st.session_state.chat_history:
+        st.info("No messages yet — type below to start chatting.")
+
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            st.write(msg["content"])
+            if msg.get("usage"):
+                u = msg["usage"]
+                st.caption(
+                    f"Tokens — prompt: {u.get('prompt_tokens', '?')}, "
+                    f"completion: {u.get('completion_tokens', '?')}, "
+                    f"total: {u.get('total_tokens', '?')} · via {msg.get('model_used', '')}"
+                )
+
+    def _send_chat_message(user_text: str):
+        attached_text = extract_text_from_upload(chat_file) if chat_file is not None else ""
+        full_prompt = f"Document:\n{attached_text}\n\nQuestion: {user_text}" if attached_text else user_text
+
+        st.session_state.chat_history.append({"role": "user", "content": user_text})
+        if client is None and not GROQ_API_KEY:
+            st.session_state.chat_history.append({
+                "role": "assistant",
+                "content": "Cannot generate: neither `GOOGLE_API_KEY` nor `GROQ_API_KEY` is set in the environment.",
+                "usage": None,
+                "model_used": None,
+            })
+            return
+        preferred = "groq" if "Groq" in chat_model_router else "gemini"
+        try:
+            text, model_used, usage = generate_with_fallback(full_prompt, chat_system_prompt, preferred=preferred)
+            if usage and usage.get("total_tokens"):
+                st.session_state.chat_token_total += usage["total_tokens"]
+            st.session_state.chat_history.append({
+                "role": "assistant", "content": text, "usage": usage, "model_used": model_used,
+            })
+        except Exception as e:
+            st.session_state.chat_history.append({
+                "role": "assistant", "content": f"API Error: {e}", "usage": None, "model_used": None,
+            })
+
+    if st.session_state.get("chat_prefill"):
+        prefill_text = st.session_state.pop("chat_prefill")
+        with st.spinner("Sending prompt from Prompt Engineering..."):
+            _send_chat_message(prefill_text)
+        st.rerun()
+
+    user_message = st.chat_input("Type your message...")
+    if user_message:
+        with st.spinner(f"Querying {chat_model_router}..."):
+            _send_chat_message(user_message)
+        st.rerun()
+
+elif st.session_state.active_page == "Request a Model":
     st.write(
         "Don't see the model you need? Tell us which provider you'd like supported. "
         "No API key is ever typed into this app — we'll just show you the exact "
@@ -784,3 +893,47 @@ else:  # "Request a Model"
                 )
                 if use_case.strip():
                     st.caption(f"Use case noted: {use_case.strip()}")
+
+else:  # "How Your Data Is Masked"
+    st.write(
+        "🔒 Your documents never leave this machine to get masked — everything below runs "
+        "locally, with no external API involved. Here's exactly what's doing the work."
+    )
+
+    with st.container(border=True):
+        st.markdown('<div class="card-heading">PII Classification Model</div>', unsafe_allow_html=True)
+
+        model_config = pii_model.nlp.model.config
+        param_count = sum(p.numel() for p in pii_model.nlp.model.parameters())
+        entity_types = sorted({label.split("-", 1)[-1] for label in model_config.id2label.values() if label != "O"})
+
+        info_col1, info_col2 = st.columns(2)
+        with info_col1:
+            st.markdown("**Architecture**")
+            st.markdown(
+                f"""
+- **Base model:** `bert-base-cased` ({model_config.model_type})
+- **Task type:** Token classification (BIO-tagged NER)
+- **Hidden size:** {model_config.hidden_size}
+- **Layers:** {model_config.num_hidden_layers}
+- **Attention heads:** {model_config.num_attention_heads}
+- **Vocabulary size:** {model_config.vocab_size:,}
+- **Total parameters:** {param_count:,} (~{param_count / 1e6:.0f}M)
+- **Output labels:** {len(model_config.id2label)} BIO tags
+"""
+            )
+        with info_col2:
+            st.markdown("**Training Data**")
+            st.markdown(
+                """
+- **Dataset:** `ai4privacy/open-pii-masking-500k-ai4privacy` (Hugging Face)
+- **Language subset used:** English only (~464k training examples)
+- **Fine-tuning:** 3 epochs, learning rate 2e-5, Hugging Face `Trainer`
+- **Reported held-out test performance:** ~99.2% weighted accuracy / precision / recall / F1
+  (token-level; dominated by the non-entity "O" class — per-type accuracy varies, see the
+  notebook's classification report for the full breakdown)
+"""
+            )
+
+        st.markdown("**Entity types detected** (from the 36 BIO output labels)")
+        st.write(", ".join(entity_types))
