@@ -15,6 +15,7 @@ import pickle
 import numpy as np
 import pandas as pd
 import torch
+import mlflow
 
 from datasets import Dataset
 from transformers import (
@@ -27,7 +28,9 @@ from transformers import (
 
 from arabic_pii.preprocessing import NERPreprocessor
 from arabic_pii.data_augmentation import DataAugmentation
-from arabic_pii.training_monitor import ExperimentTracker, PIIEvaluator
+from arabic_pii.training_monitor import (
+    ExperimentTracker, PIIEvaluator, MLflowEpochCallback, setup_mlflow
+)
 
 MODEL_NAME = 'aubmindlab/bert-base-arabertv2'
 OUTPUT_DIR = 'arabic_pii_model'
@@ -77,7 +80,10 @@ def make_compute_metrics(evaluator: PIIEvaluator):
 
 
 def train(args):
-    tracker = ExperimentTracker(run_name=args.run_name)
+    # ── MLflow setup ────────────────────────────────────────────────────────
+    setup_mlflow(experiment_name='arabic-pii-ner')
+    run_name = args.run_name or f'arabert_pii_{"full" if args.full else "quick"}'
+    tracker = ExperimentTracker(run_name=run_name)
 
     # ── Step 1: Data pipeline ───────────────────────────────────────────────
     print("\n=== STEP 1: DATA PIPELINE ===")
@@ -120,13 +126,17 @@ def train(args):
         'learning_rate': args.learning_rate,
         'batch_size': args.batch_size,
         'gradient_accumulation_steps': args.grad_accum,
+        'effective_batch_size': args.batch_size * args.grad_accum,
         'epochs': args.epochs,
         'max_seq_length': args.max_seq_length,
         'weight_decay': 0.01,
         'warmup_steps': 100,
-        'fp16': False,  # CPU-only
+        'lr_scheduler': 'linear',
+        'optimizer': 'adamw',
+        'fp16': False,
         'train_sentences': len(train_dataset),
         'val_sentences': len(val_dataset),
+        'test_sentences': len(test_dataset),
     }
     tracker.log_hyperparameters(hparams)
     print("Hyperparameters:", hparams)
@@ -141,7 +151,7 @@ def train(args):
         weight_decay=0.01,
         warmup_steps=100,
         lr_scheduler_type='linear',
-        evaluation_strategy='epoch',
+        eval_strategy='epoch',
         save_strategy='epoch',
         logging_strategy='steps',
         logging_steps=50,
@@ -149,17 +159,18 @@ def train(args):
         metric_for_best_model='f1',
         greater_is_better=True,
         save_total_limit=2,
-        fp16=False,                    # CPU-only
-        gradient_checkpointing=False,  # CPU-only
+        fp16=False,
+        use_cpu=True,
         dataloader_num_workers=0,
         remove_unused_columns=False,
-        report_to=None,               # no wandb / tensorboard
+        report_to='none',
         seed=42,
     )
 
     data_collator = DataCollatorForTokenClassification(
         preprocessor.tokenizer, padding=True
     )
+    mlflow_cb = MLflowEpochCallback(json_tracker=tracker)
 
     trainer = Trainer(
         model=model,
@@ -168,34 +179,50 @@ def train(args):
         eval_dataset=val_dataset,
         data_collator=data_collator,
         compute_metrics=make_compute_metrics(evaluator),
+        callbacks=[mlflow_cb],
     )
 
-    print("\nStarting training (CPU)...")
-    trainer.train()
+    # ── MLflow run wraps everything from training → model artifact ──────────
+    with mlflow.start_run(run_name=run_name) as run:
+        print(f"\nMLflow run ID: {run.info.run_id}")
+        mlflow.log_params(hparams)
 
-    # ── Step 5: Evaluation ──────────────────────────────────────────────────
-    print("\n=== STEP 5: EVALUATION ===")
-    print("Evaluating on test set...")
-    test_results = trainer.evaluate(eval_dataset=test_dataset)
-    print("\nTest results:")
-    for k, v in test_results.items():
-        if k.startswith('eval_'):
-            print(f"  {k.replace('eval_', ''):25s} {v:.4f}")
+        print("\nStarting training (CPU)...")
+        trainer.train()
 
-    final_metrics = {k.replace('eval_', ''): v for k, v in test_results.items() if k.startswith('eval_')}
+        # ── Step 5: Evaluation ──────────────────────────────────────────────
+        print("\n=== STEP 5: EVALUATION ===")
+        print("Evaluating on test set...")
+        test_results = trainer.evaluate(eval_dataset=test_dataset)
+        final_metrics = {
+            k.replace('eval_', ''): v
+            for k, v in test_results.items()
+            if k.startswith('eval_') and isinstance(v, (int, float))
+        }
+
+        print("\nTest results:")
+        for k, v in final_metrics.items():
+            print(f"  {k:25s} {v:.4f}")
+
+        # Log final test metrics to MLflow
+        mlflow.log_metrics({f'test_{k}': v for k, v in final_metrics.items()})
+
+        # ── Step 6: Save model + log artifact ──────────────────────────────
+        print(f"\n=== STEP 6: SAVING MODEL → {OUTPUT_DIR} ===")
+        trainer.save_model(OUTPUT_DIR)
+        preprocessor.tokenizer.save_pretrained(OUTPUT_DIR)
+        with open(os.path.join(OUTPUT_DIR, 'label_mappings.pkl'), 'wb') as f:
+            pickle.dump({
+                'label_to_id': preprocessor.label_to_id,
+                'id_to_label': preprocessor.id_to_label,
+            }, f)
+
+        mlflow.log_artifact(OUTPUT_DIR, artifact_path='model')
+        mlflow.log_artifact(str(tracker.log_path), artifact_path='logs')
+
     tracker.finish(final_metrics)
-
-    # ── Step 6: Save model ──────────────────────────────────────────────────
-    print(f"\n=== STEP 6: SAVING MODEL → {OUTPUT_DIR} ===")
-    trainer.save_model(OUTPUT_DIR)
-    preprocessor.tokenizer.save_pretrained(OUTPUT_DIR)
-    with open(os.path.join(OUTPUT_DIR, 'label_mappings.pkl'), 'wb') as f:
-        pickle.dump({
-            'label_to_id': preprocessor.label_to_id,
-            'id_to_label': preprocessor.id_to_label,
-        }, f)
-
     print(f"\nModel saved to: {OUTPUT_DIR}/")
+    print(f"View all runs: mlflow ui --backend-store-uri mlruns")
     print("Training complete.")
     return trainer, final_metrics
 
