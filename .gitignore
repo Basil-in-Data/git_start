@@ -4,3 +4,14 @@ __pycache__/
 *.pyc
 pii_model/
 .claude/settings.local.json
+
+# Arabic PII — generated outputs (re-creatable)
+arabic_pii_model/
+arabic_pii_source/
+train_augmented.csv
+val_augmented.csv
+test_augmented.csv
+mlflow.db
+experiment_logs/
+my.txt
+*.pdf

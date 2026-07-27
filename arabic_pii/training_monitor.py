@@ -62,12 +62,13 @@ class ExperimentTracker:
 
 # ── MLflow helpers ────────────────────────────────────────────────────────────
 
-def setup_mlflow(experiment_name: str = 'arabic-pii-ner', tracking_uri: str = 'mlruns'):
-    """Configure MLflow to log locally (no server needed)."""
-    mlflow.set_tracking_uri(tracking_uri)
+def setup_mlflow(experiment_name: str = 'arabic-pii-ner', db_path: str = 'mlflow.db'):
+    """Configure MLflow with a local SQLite backend (required by MLflow 3.x)."""
+    uri = f'sqlite:///{db_path}'
+    mlflow.set_tracking_uri(uri)
     mlflow.set_experiment(experiment_name)
-    print(f"MLflow tracking URI: {tracking_uri}/")
-    print(f"View runs: mlflow ui --backend-store-uri {tracking_uri}")
+    print(f"MLflow tracking URI: {uri}")
+    print(f"View runs after training: mlflow ui --backend-store-uri {uri}")
 
 
 # ── HuggingFace Trainer callback ──────────────────────────────────────────────

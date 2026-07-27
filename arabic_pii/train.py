@@ -222,7 +222,7 @@ def train(args):
 
     tracker.finish(final_metrics)
     print(f"\nModel saved to: {OUTPUT_DIR}/")
-    print(f"View all runs: mlflow ui --backend-store-uri mlruns")
+    print(f"View all runs: mlflow ui --backend-store-uri sqlite:///mlflow.db")
     print("Training complete.")
     return trainer, final_metrics
 
