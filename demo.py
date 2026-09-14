@@ -23,6 +23,14 @@ GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
 PII_MODEL_DIR = os.path.join(os.path.dirname(__file__), "pii_model")
+ARABIC_PII_MODEL_DIR = os.path.join(os.path.dirname(__file__), "arabic_pii_model")
+
+# Arabic regex safety-net (always available; ML model is optional until trained)
+try:
+    from arabic_pii.rules import ArabicPIIDetector as _ArabicPIIDetector
+    _arabic_rules_available = True
+except ImportError:
+    _arabic_rules_available = False
 
 # Each strategy is a reusable template with {{variable}} placeholders instead
 # of one hardcoded topic slot. "defaults" both declares which variables the
@@ -619,7 +627,113 @@ def load_pii_model():
     return PIIMaskingModel(PII_MODEL_DIR)
 
 
+# ==========================================
+# ARABIC PII MODEL
+# ==========================================
+class ArabicPIIMaskingModel:
+    """
+    Arabic PII detector: fine-tuned AraBERT (arabic_pii_model/) for contextual
+    NER (names, locations, orgs) + ArabicPIIDetector regex safety net for
+    structured PII (phones, emails, IDs, IBANs).
+
+    Gracefully degrades to regex-only if the model hasn't been trained yet —
+    run `python -m arabic_pii.train` first, then restart the app.
+    """
+
+    def __init__(self, model_dir: str):
+        self._has_ml = False
+        self._nlp = None
+        if os.path.isdir(model_dir):
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(model_dir)
+                model = AutoModelForTokenClassification.from_pretrained(model_dir)
+                self._nlp = pipeline(
+                    "token-classification",
+                    model=model,
+                    tokenizer=tokenizer,
+                    aggregation_strategy="simple",
+                )
+                self._has_ml = True
+            except Exception:
+                pass  # model dir exists but is incomplete — fall back to regex
+
+        if _arabic_rules_available:
+            self._regex = _ArabicPIIDetector()
+        else:
+            self._regex = None
+
+    @property
+    def mode(self) -> str:
+        if self._has_ml and self._regex:
+            return "ML + Regex"
+        if self._has_ml:
+            return "ML only"
+        if self._regex:
+            return "Regex only (train model to enable ML)"
+        return "unavailable"
+
+    @staticmethod
+    def _merge_overlaps(findings: list) -> list:
+        findings = sorted(findings, key=lambda f: f["start"])
+        merged = []
+        for f in findings:
+            if merged and f["start"] < merged[-1]["end"]:
+                prev = merged[-1]
+                prev["end"] = max(prev["end"], f["end"])
+                if f["score"] > prev["score"]:
+                    prev["type"] = f["type"]
+                    prev["score"] = f["score"]
+            else:
+                merged.append(dict(f))
+        return merged
+
+    def detect(self, text: str) -> list:
+        findings = []
+
+        # 1. AraBERT ML model (contextual NER)
+        if self._has_ml and self._nlp:
+            raw = sorted(self._nlp(text), key=lambda e: e["start"])
+            for e in raw:
+                findings.append({
+                    "type": e["entity_group"],
+                    "start": e["start"],
+                    "end": e["end"],
+                    "score": e["score"],
+                    "value": text[e["start"]:e["end"]],
+                })
+
+        # 2. Regex safety net (phones, emails, IDs, IBANs, etc.)
+        if self._regex:
+            for match in self._regex.detect(text):
+                findings.append({
+                    "type": match.pii_type,
+                    "start": match.start_pos,
+                    "end": match.end_pos,
+                    "score": match.confidence,
+                    "value": match.text,
+                })
+
+        findings = self._merge_overlaps(findings)
+        for f in findings:
+            f["value"] = text[f["start"]:f["end"]]
+        return findings
+
+    def mask(self, text: str, strict: bool = False) -> tuple:
+        findings = self.detect(text)
+        clean_text = text
+        for f in sorted(findings, key=lambda f: -f["start"]):
+            tag = "[REDACTED]" if strict else f"[REDACTED_{f['type']}]"
+            clean_text = clean_text[: f["start"]] + tag + clean_text[f["end"]:]
+        return clean_text, findings
+
+
+@st.cache_resource(show_spinner="Loading Arabic PII model...")
+def load_arabic_pii_model():
+    return ArabicPIIMaskingModel(ARABIC_PII_MODEL_DIR)
+
+
 pii_model = load_pii_model()
+arabic_model = load_arabic_pii_model()
 
 # --- PAGE ROUTING (driven by the sidebar nav buttons above) ---
 if st.session_state.active_page == "Secure your files":
@@ -646,6 +760,14 @@ if st.session_state.active_page == "Secure your files":
     with card_col2:
         with st.container(border=True):
             st.markdown('<div class="card-heading">2. Masking Configuration</div>', unsafe_allow_html=True)
+
+            doc_language = st.radio(
+                "Document Language",
+                ["🇬🇧 English", "🇸🇦 Arabic"],
+                horizontal=True,
+                help="English uses bert-base-cased. Arabic uses AraBERT + regex safety net.",
+            )
+
             masking_purpose = st.selectbox(
                 "Masking Purpose",
                 [
@@ -653,8 +775,20 @@ if st.session_state.active_page == "Secure your files":
                     "External Vendor Sharing (Strict Data Privacy Redaction)",
                 ],
             )
+
+            # Show Arabic model status when Arabic is selected
+            if "Arabic" in doc_language:
+                mode = arabic_model.mode
+                if "Regex only" in mode:
+                    st.warning(
+                        f"⚠️ Arabic model: **{mode}** — "
+                        "run `python -m arabic_pii.train` then restart the app to enable ML detection."
+                    )
+                else:
+                    st.success(f"✅ Arabic model ready: **{mode}**")
+
             st.caption(
-                "🔒 Masking always executes locally via the fine-tuned PII model below — "
+                "🔒 Masking always executes locally via the fine-tuned PII model — "
                 "no document text is ever sent to an external API."
             )
             run_pipeline = st.button("🚀 Run PII Masking Pipeline", type="primary")
@@ -670,9 +804,12 @@ if st.session_state.active_page == "Secure your files":
             st.warning("Please upload a file or paste some text before running the pipeline.")
         else:
             strict = masking_purpose.startswith("External Vendor")
+            is_arabic = "Arabic" in doc_language
+            active_model = arabic_model if is_arabic else pii_model
+            spinner_label = "Running Arabic PII detection (AraBERT + regex)..." if is_arabic else "Running PII classification & masking model..."
 
-            with st.spinner("Running PII classification & masking model..."):
-                clean_text, findings = pii_model.mask(source_text, strict=strict)
+            with st.spinner(spinner_label):
+                clean_text, findings = active_model.mask(source_text, strict=strict)
 
             with st.container(border=True):
                 st.markdown('<div class="card-heading">3. Redacted Document — Ready to Share</div>', unsafe_allow_html=True)
@@ -937,3 +1074,50 @@ else:  # "How Your Data Is Masked"
 
         st.markdown("**Entity types detected** (from the 36 BIO output labels)")
         st.write(", ".join(entity_types))
+
+    with st.container(border=True):
+        st.markdown('<div class="card-heading">Arabic PII Detection Model</div>', unsafe_allow_html=True)
+
+        ar_col1, ar_col2 = st.columns(2)
+        with ar_col1:
+            st.markdown("**Architecture**")
+            if arabic_model._has_ml and arabic_model._nlp:
+                ar_config = arabic_model._nlp.model.config
+                ar_params = sum(p.numel() for p in arabic_model._nlp.model.parameters())
+                st.markdown(
+                    f"""
+- **Base model:** `aubmindlab/bert-base-arabertv2` ({ar_config.model_type})
+- **Task type:** Token classification (BIO-tagged NER)
+- **Hidden size:** {ar_config.hidden_size}
+- **Layers:** {ar_config.num_hidden_layers}
+- **Attention heads:** {ar_config.num_attention_heads}
+- **Vocabulary size:** {ar_config.vocab_size:,}
+- **Total parameters:** {ar_params:,} (~{ar_params / 1e6:.0f}M)
+- **Detection mode:** {arabic_model.mode}
+"""
+                )
+            else:
+                st.markdown(
+                    f"""
+- **Base model:** `aubmindlab/bert-base-arabertv2` (AraBERT v2)
+- **Task type:** Token classification (BIO-tagged NER)
+- **Parameters:** ~110M (12 layers, 768 hidden, 12 heads)
+- **Detection mode:** {arabic_model.mode}
+- **Status:** Model not yet trained — run `python -m arabic_pii.train` to enable ML
+"""
+                )
+        with ar_col2:
+            st.markdown("**Training Data**")
+            st.markdown(
+                """
+- **Dataset:** Wojood Arabic NER corpus (562k tokens) + synthetic data
+- **Wojood splits:** 391k train / 57.5k val / 113.7k test tokens
+- **Synthetic data:** ~500 generated Arabic sentences (phones, IDs, emails)
+- **Label mapping:** PERS→PERSON, GPE/LOC→LOCATION, ORG→ORGANIZATION; all others→O
+- **Fine-tuning:** CPU training, 1–3 epochs, AraBERT tokenizer with Farasa segmentation
+- **Entity types:** PERSON, LOCATION, ORGANIZATION, PHONE, EMAIL, ID_NUMBER, ADDRESS
+"""
+            )
+
+        st.markdown("**Regex safety net** — always active regardless of ML model status")
+        st.write("PHONE (Saudi/UAE/Jordan/Egypt), EMAIL, NATIONAL_ID, IBAN, CREDIT_CARD, PASSPORT, IMEI, IP_ADDRESS")
